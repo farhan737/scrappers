@@ -49,7 +49,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 # TODO: set this to the real site domain (no scheme, no trailing slash).
-SITE_DOMAIN = "novelfull.com"
+SITE_DOMAIN = "example.com"
 
 CONFIG_DIR = Path.home() / ".config" / "webscraper"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -168,8 +168,12 @@ def sanitize_name(name):
     return re.sub(r'[\\/*?:"<>|]', "_", name).strip()
 
 
-def output_dir_for(page_name, chapter_name):
-    return Path(sanitize_name(page_name))
+def txt_dir_for(page_name):
+    return Path(sanitize_name(page_name)) / "allchaptersarchivetxt"
+
+
+def epub_dir_for(page_name):
+    return Path(sanitize_name(page_name)) / "allchaptersarchive"
 
 
 def save_txt(out_dir, chapter_name, title, paragraphs):
@@ -207,9 +211,8 @@ def save_epub(out_dir, chapter_name, title, paragraphs):
 
 
 def save_chapter(page_name, chapter_name, title, paragraphs):
-    out_dir = output_dir_for(page_name, chapter_name)
-    txt_path = save_txt(out_dir, chapter_name, title, paragraphs)
-    epub_path = save_epub(out_dir, chapter_name, title, paragraphs)
+    txt_path = save_txt(txt_dir_for(page_name), chapter_name, title, paragraphs)
+    epub_path = save_epub(epub_dir_for(page_name), chapter_name, title, paragraphs)
     print(f"Saved:\n  {txt_path}\n  {epub_path}")
 
 

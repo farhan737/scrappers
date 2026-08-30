@@ -5,6 +5,10 @@ Build a single .epub from a directory of chapter .txt files.
 Usage:
     python build_epub.py <directory-name>
 
+<directory-name> is expected to be the chapter-txt folder produced by
+webscraper.py, e.g. <page-name>/allchaptersarchivetxt/. The combined
+book epub is saved one level up, at <page-name>/<book-name>.epub.
+
 Expects files inside <directory-name> named like:
     <anything>-<chapter-number>-<chapter-name-with-dashes>.txt
     <anything>-<chapter-number>.txt          (name missing -> you'll be prompted)
@@ -22,7 +26,7 @@ For each file:
     - If a file has no name segment, you're prompted to enter one.
 
 You'll be prompted for the book's title (used as the epub's title and
-as the output filename: <book-name>.epub, saved inside <directory-name>).
+as the output filename: <book-name>.epub).
 """
 
 import argparse
@@ -187,7 +191,7 @@ def build_epub(directory: Path, book_name: str, chapters: list):
     book.add_item(epub.EpubNav())
     book.spine = ["nav"] + epub_chapters
 
-    output_path = directory / f"{sanitize_filename(book_name)}.epub"
+    output_path = directory.parent / f"{sanitize_filename(book_name)}.epub"
     epub.write_epub(str(output_path), book)
     return output_path
 
