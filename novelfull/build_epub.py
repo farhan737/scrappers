@@ -41,11 +41,14 @@ except ImportError:
     sys.exit(1)
 
 
-# Matches: [<any-word>-]<number>[-<name>].txt
+# Matches: [<any-word>-]<number>[.<part>][-<name>].txt
 # The word before the number (e.g. "chapter", "chaoter", "chspter") is
-# ignored entirely — only the number and optional name matter.
+# ignored entirely — only the number, optional part, and name matter.
+# A '.part' suffix marks a multi-part chapter, e.g. 'chapter-143.2-name.txt'
+# is part 2 of chapter 143.
 GENERIC_PATTERN = re.compile(
-    r"^(?:[A-Za-z]+-)?(?P<number>\d+)(?:-(?P<name>.+))?\.txt$", re.IGNORECASE
+    r"^(?:[A-Za-z]+-)?(?P<number>\d+)(?:\.(?P<part>\d+))?(?:-(?P<name>.+))?\.txt$",
+    re.IGNORECASE,
 )
 
 
@@ -69,10 +72,15 @@ def sanitize_filename(name):
     return re.sub(r'[\\/*?:"<>|]', "_", name).strip()
 
 
-def prompt_for_chapter_name(number: int, filename: str) -> str:
-    print(f"\n'{filename}' (chapter {number}) is missing a chapter name.")
+def format_number_label(number: int, part: int) -> str:
+    return f"{number}.{part}" if part else str(number)
+
+
+def prompt_for_chapter_name(number: int, part: int, filename: str) -> str:
+    label = format_number_label(number, part)
+    print(f"\n'{filename}' (chapter {label}) is missing a chapter name.")
     while True:
-        name = input(f"Enter a name for chapter {number}: ").strip()
+        name = input(f"Enter a name for chapter {label}: ").strip()
         if name:
             return name
         print("Name cannot be empty.")
@@ -80,15 +88,16 @@ def prompt_for_chapter_name(number: int, filename: str) -> str:
 
 def discover_chapters(directory: Path):
     """
-    Return a list of dicts: {number, raw_name, title, path},
-    sorted by chapter number ascending.
+    Return a list of dicts: {number, part, raw_name, title, path},
+    sorted by (number, part) ascending.
 
     The prefix word before the number (e.g. "chapter", "chaoter") is
-    ignored entirely — only <number> and optional <name> are read, so
-    typos in that word don't matter.
+    ignored entirely — only <number>, optional <part>, and optional
+    <name> are read, so typos in that word don't matter.
 
-    - <word>-<N>-<name>.txt  -> normal case
-    - <word>-<N>.txt         -> missing name, prompts for one
+    - <word>-<N>-<name>.txt      -> normal case
+    - <word>-<N>.txt             -> missing name, prompts for one
+    - <word>-<N>.<P>-<name>.txt  -> part P of chapter N
     Anything without a parseable number is skipped with a note.
     """
     chapters = []
@@ -101,28 +110,74 @@ def discover_chapters(directory: Path):
             continue
 
         number = int(match.group("number"))
+        part = int(match.group("part")) if match.group("part") else 0
         raw_name = match.group("name")
 
         if raw_name:
             chapters.append(
                 {
                     "number": number,
+                    "part": part,
                     "raw_name": raw_name,
                     "title": format_chapter_title(raw_name),
                     "path": txt_path,
                 }
             )
         else:
-            title = prompt_for_chapter_name(number, txt_path.name)
+            title = prompt_for_chapter_name(number, part, txt_path.name)
             chapters.append(
-                {"number": number, "raw_name": None, "title": title, "path": txt_path}
+                {
+                    "number": number,
+                    "part": part,
+                    "raw_name": None,
+                    "title": title,
+                    "path": txt_path,
+                }
             )
 
     for f in unmatched:
         print(f"Skipping (couldn't find a chapter number in): {f.name}")
 
-    chapters.sort(key=lambda c: c["number"])
+    chapters = resolve_duplicate_numbers(chapters)
+    chapters.sort(key=lambda c: (c["number"], c["part"]))
     return chapters
+
+
+def resolve_duplicate_numbers(chapters: list) -> list:
+    """
+    If two or more files claim the same (number, part), ask which one
+    to actually use. Leaves unique (number, part) pairs alone.
+    """
+    groups = {}
+    for chapter in chapters:
+        key = (chapter["number"], chapter["part"])
+        groups.setdefault(key, []).append(chapter)
+
+    resolved = []
+    for key, group in groups.items():
+        if len(group) == 1:
+            resolved.append(group[0])
+            continue
+
+        label = format_number_label(*key)
+        print(f"\nMultiple files found for chapter {label}:")
+        for i, c in enumerate(group):
+            print(f"  [{i}] {c['title']}  ({c['path'].name})")
+
+        while True:
+            choice = input(
+                f"Which one should be chapter {label}? Enter number: "
+            ).strip()
+            if choice.isdigit() and int(choice) < len(group):
+                resolved.append(group[int(choice)])
+                break
+            print("Invalid choice, try again.")
+
+        skipped = [c for i, c in enumerate(group) if str(i) != choice]
+        for c in skipped:
+            print(f"Skipping (not selected for chapter {label}): {c['path'].name}")
+
+    return resolved
 
 
 def read_chapter_body(path: Path):
@@ -153,7 +208,7 @@ def paragraphs_to_html(paragraphs):
 # EPUB building
 # ---------------------------------------------------------------------------
 
-def build_epub(directory: Path, book_name: str, chapters: list):
+def build_epub(txt_directory: Path, output_dir: Path, book_name: str, chapters: list):
     book = epub.EpubBook()
     book.set_identifier(sanitize_filename(book_name) or "book")
     book.set_title(book_name)
@@ -168,8 +223,10 @@ def build_epub(directory: Path, book_name: str, chapters: list):
             print(f"Warning: no content found in {chapter['path'].name}, skipping.")
             continue
 
-        chapter_heading = f"Chapter {chapter['number']}: {chapter['title']}"
-        file_name = f"chap_{chapter['number']:04d}.xhtml"
+        number_label = format_number_label(chapter["number"], chapter["part"])
+        chapter_heading = f"Chapter {number_label}: {chapter['title']}"
+        file_name = f"chap_{chapter['number']:04d}_{chapter['part']:02d}.xhtml"
+        uid = f"chap_{chapter['number']}_{chapter['part']}"
 
         epub_chapter = epub.EpubHtml(
             title=chapter_heading, file_name=file_name, lang="en"
@@ -180,7 +237,7 @@ def build_epub(directory: Path, book_name: str, chapters: list):
 
         book.add_item(epub_chapter)
         epub_chapters.append(epub_chapter)
-        toc_links.append(epub.Link(file_name, chapter_heading, f"chap_{chapter['number']}"))
+        toc_links.append(epub.Link(file_name, chapter_heading, uid))
 
     if not epub_chapters:
         print("No chapters with usable content were found. Aborting.")
@@ -191,7 +248,7 @@ def build_epub(directory: Path, book_name: str, chapters: list):
     book.add_item(epub.EpubNav())
     book.spine = ["nav"] + epub_chapters
 
-    output_path = directory.parent / f"{sanitize_filename(book_name)}.epub"
+    output_path = output_dir / f"{sanitize_filename(book_name)}.epub"
     epub.write_epub(str(output_path), book)
     return output_path
 
@@ -212,21 +269,32 @@ def main():
         print(f"Error: '{directory}' is not a directory.")
         sys.exit(1)
 
+    # If pointed at the page-name folder itself (e.g. produced by
+    # webscraper.py), automatically descend into allchaptersarchivetxt/
+    # and save the combined epub back up in the page-name folder.
+    txt_directory = directory
+    output_dir = directory
+    archive_subdir = directory / "allchaptersarchivetxt"
+    if archive_subdir.is_dir():
+        txt_directory = archive_subdir
+        output_dir = directory
+
     book_name = input("Book name: ").strip()
     if not book_name:
         print("Error: book name cannot be empty.")
         sys.exit(1)
 
-    chapters = discover_chapters(directory)
+    chapters = discover_chapters(txt_directory)
     if not chapters:
-        print(f"No files matching 'chapter-<number>-<name>.txt' found in {directory}.")
+        print(f"No files matching 'chapter-<number>-<name>.txt' found in {txt_directory}.")
         sys.exit(1)
 
     print(f"Found {len(chapters)} chapter(s):")
     for c in chapters:
-        print(f"  {c['number']:>4}  {c['title']}  ({c['path'].name})")
+        label = format_number_label(c["number"], c["part"])
+        print(f"  {label:>7}  {c['title']}  ({c['path'].name})")
 
-    output_path = build_epub(directory, book_name, chapters)
+    output_path = build_epub(txt_directory, output_dir, book_name, chapters)
     if output_path is None:
         sys.exit(1)
 

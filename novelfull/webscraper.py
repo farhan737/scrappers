@@ -7,7 +7,15 @@ Fetches chapter content from a site with URL pattern:
 
 Content is read from <div id="chapter-content"> (paragraphs may be nested
 inside sub-divs). Each chapter is saved as both .txt and .epub under:
-    <page-name>/<chapter-name>/
+    <page-name>/allchaptersarchivetxt/   (.txt)
+    <page-name>/allchaptersarchive/      (.epub)
+
+Multi-part chapters: some sites encode "part 2 of chapter 143" as
+chapter-1432 (base number with the part digit(s) appended directly).
+When following next/prev links (interactively or via --save-till), this
+is detected by comparing each fetched chapter's number against the last
+known base chapter number, and saved as 'chapter-143.2-<name>' so
+build_epub.py can order/label parts correctly (Chapter 143, 143.2, ...).
 
 Usage:
     python webscraper.py
@@ -161,6 +169,72 @@ def parse_page_and_chapter_from_url(url):
 
 
 # ---------------------------------------------------------------------------
+# Multi-part chapter detection
+# ---------------------------------------------------------------------------
+# Some sites encode "part 2 of chapter 143" as chapter-1432 (base number
+# with the part digit(s) appended directly, no separator) instead of a
+# genuinely new chapter number. We detect this by comparing each fetched
+# chapter's numeric slug against the last known *base* chapter number: if
+# it starts with that base and has extra digit(s) tacked on, it's treated
+# as a part of that base chapter rather than a new chapter.
+
+CHAPTER_SLUG_PATTERN = re.compile(r"^[A-Za-z]+-(\d+)(?:-(.*))?$")
+
+
+def parse_chapter_slug(chapter_name):
+    """
+    Parse a raw chapter-name slug like 'chapter-143-some-name' into
+    (number_str, name_or_None). Returns (None, None) if it doesn't look
+    like a numbered chapter slug at all.
+    """
+    match = CHAPTER_SLUG_PATTERN.match(chapter_name)
+    if not match:
+        return None, None
+    return match.group(1), match.group(2)
+
+
+def resolve_base_and_part(raw_number_str, current_base):
+    """
+    Decide whether raw_number_str is a new base chapter number or a part
+    of current_base. Returns (base, part) where part is 0 for a normal,
+    non-part chapter.
+    """
+    if current_base is not None:
+        base_str = str(current_base)
+        if raw_number_str.startswith(base_str) and len(raw_number_str) > len(base_str):
+            suffix = raw_number_str[len(base_str):]
+            if suffix.isdigit() and int(suffix) >= 2:
+                return current_base, int(suffix)
+    return int(raw_number_str), 0
+
+
+def chapter_save_label(chapter_name, current_base):
+    """
+    Given the raw chapter-name slug actually used in the URL, and the
+    session's last known base chapter number, return (save_label, new_base).
+
+    save_label is what gets used for the saved .txt/.epub filenames:
+        base chapter  -> 'chapter-143-<name>'
+        part 2 of 143 -> 'chapter-143.2-<name>'
+    so build_epub.py can order and label them correctly.
+
+    Falls back to returning chapter_name unchanged (and current_base
+    unchanged) if the slug doesn't look numbered at all.
+    """
+    number_str, name_part = parse_chapter_slug(chapter_name)
+    if number_str is None:
+        return chapter_name, current_base
+
+    base, part = resolve_base_and_part(number_str, current_base)
+    name_suffix = f"-{name_part}" if name_part else ""
+    if part:
+        label = f"chapter-{base}.{part}{name_suffix}"
+    else:
+        label = f"chapter-{base}{name_suffix}"
+    return label, base
+
+
+# ---------------------------------------------------------------------------
 # Saving
 # ---------------------------------------------------------------------------
 
@@ -220,11 +294,15 @@ def save_chapter(page_name, chapter_name, title, paragraphs):
 # Core chapter fetch+save routine
 # ---------------------------------------------------------------------------
 
-def process_chapter(page_name, chapter_name, confirm=True):
+def process_chapter(page_name, chapter_name, confirm=True, session_state=None):
     """
     Fetch, display a short preview, optionally confirm, then save.
     Returns the BeautifulSoup of the fetched page (for nav links),
     or None if the user declined to save.
+
+    session_state, if provided, is a dict with a 'current_base' key used
+    to detect multi-part chapters across a sequence of fetches (see
+    chapter_save_label). The dict is updated in place.
     """
     url = build_url(page_name, chapter_name)
     print(f"\nFetching: {url}")
@@ -245,7 +323,16 @@ def process_chapter(page_name, chapter_name, confirm=True):
             print("Skipped.")
             return soup
 
-    save_chapter(page_name, chapter_name, title, paragraphs)
+    save_label = chapter_name
+    if session_state is not None:
+        save_label, new_base = chapter_save_label(
+            chapter_name, session_state.get("current_base")
+        )
+        session_state["current_base"] = new_base
+        if save_label != chapter_name:
+            print(f"Detected as a chapter part -> saving as: {save_label}")
+
+    save_chapter(page_name, save_label, title, paragraphs)
     return soup
 
 
@@ -253,7 +340,7 @@ def process_chapter(page_name, chapter_name, confirm=True):
 # Interactive post-save menu
 # ---------------------------------------------------------------------------
 
-def interactive_loop(page_name, chapter_name, soup):
+def interactive_loop(page_name, chapter_name, soup, session_state):
     current_url = build_url(page_name, chapter_name)
 
     while True:
@@ -273,7 +360,12 @@ def interactive_loop(page_name, chapter_name, soup):
             if not chapter_name:
                 print("Chapter name cannot be empty.")
                 continue
-            new_soup = process_chapter(page_name, chapter_name, confirm=True)
+            # A manually-entered chapter isn't necessarily sequential with
+            # whatever came before, so stop treating it as a "part".
+            session_state["current_base"] = None
+            new_soup = process_chapter(
+                page_name, chapter_name, confirm=True, session_state=session_state
+            )
             if new_soup is not None:
                 soup = new_soup
                 current_url = build_url(page_name, chapter_name)
@@ -293,7 +385,9 @@ def interactive_loop(page_name, chapter_name, soup):
                 continue
 
             print(f"Navigating to: {nav_url}")
-            new_soup = process_chapter(new_page_name, new_chapter_name, confirm=True)
+            new_soup = process_chapter(
+                new_page_name, new_chapter_name, confirm=True, session_state=session_state
+            )
             if new_soup is not None:
                 soup = new_soup
                 page_name, chapter_name = new_page_name, new_chapter_name
@@ -310,6 +404,7 @@ def interactive_loop(page_name, chapter_name, soup):
 def save_till(page_name, start_chapter_name, do_till):
     chapter_name = start_chapter_name
     current_url = build_url(page_name, chapter_name)
+    session_state = {"current_base": None}
 
     for step in range(1, do_till + 1):
         print(f"\n[{step}/{do_till}]")
@@ -323,7 +418,14 @@ def save_till(page_name, start_chapter_name, do_till):
             print("Stopping batch run.")
             return
 
-        save_chapter(page_name, chapter_name, title, paragraphs)
+        save_label, new_base = chapter_save_label(
+            chapter_name, session_state["current_base"]
+        )
+        session_state["current_base"] = new_base
+        if save_label != chapter_name:
+            print(f"Detected as a chapter part -> saving as: {save_label}")
+
+        save_chapter(page_name, save_label, title, paragraphs)
         current_url = url
 
         if step == do_till:
@@ -434,11 +536,12 @@ def main():
             print("Error: chapter-name cannot be empty.")
             sys.exit(1)
 
-    soup = process_chapter(page_name, chapter_name, confirm=False)
+    session_state = {"current_base": None}
+    soup = process_chapter(page_name, chapter_name, confirm=False, session_state=session_state)
     if soup is None:
         sys.exit(1)
 
-    interactive_loop(page_name, chapter_name, soup)
+    interactive_loop(page_name, chapter_name, soup, session_state)
 
 
 if __name__ == "__main__":
