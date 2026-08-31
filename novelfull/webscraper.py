@@ -10,12 +10,15 @@ inside sub-divs). Each chapter is saved as both .txt and .epub under:
     <page-name>/allchaptersarchivetxt/   (.txt)
     <page-name>/allchaptersarchive/      (.epub)
 
-Multi-part chapters: some sites encode "part 2 of chapter 143" as
-chapter-1432 (base number with the part digit(s) appended directly).
-When following next/prev links (interactively or via --save-till), this
-is detected by comparing each fetched chapter's number against the last
-known base chapter number, and saved as 'chapter-143.2-<name>' so
-build_epub.py can order/label parts correctly (Chapter 143, 143.2, ...).
+Multi-part chapters: the base chapter number increments normally
+(142, 143, 144, ...); a chapter with multiple parts appends one or two
+extra trailing digit(s) for the part number onto that chapter's number
+(e.g. chapter 143 part 1 -> 1431, part 2 -> 1432, chapter 144 part 1 ->
+1441). When following next/prev links (interactively or via
+--save-till), this is detected by checking each fetched chapter's raw
+number against the last known base (or base+1), and saved as
+'chapter-143-<name>' for part 1 (or no parts) and 'chapter-143.2-<name>'
+for part 2+, so build_epub.py can order/label parts correctly.
 
 Usage:
     python webscraper.py
@@ -171,12 +174,18 @@ def parse_page_and_chapter_from_url(url):
 # ---------------------------------------------------------------------------
 # Multi-part chapter detection
 # ---------------------------------------------------------------------------
-# Some sites encode "part 2 of chapter 143" as chapter-1432 (base number
-# with the part digit(s) appended directly, no separator) instead of a
-# genuinely new chapter number. We detect this by comparing each fetched
-# chapter's numeric slug against the last known *base* chapter number: if
-# it starts with that base and has extra digit(s) tacked on, it's treated
-# as a part of that base chapter rather than a new chapter.
+# The base chapter number increments normally, chapter to chapter (142,
+# 143, 144, ...). When a chapter has multiple parts, the site appends one
+# or two extra trailing digit(s) for the part number onto that chapter's
+# number, e.g. chapter 143 part 1 -> 1431, part 2 -> 1432, then chapter
+# 144 part 1 -> 1441, part 2 -> 1442.
+#
+# We detect this by checking whether a fetched chapter's raw number is
+# either the current base (still inside the same multi-part chapter) or
+# current_base + 1 (starting the next chapter), with 1-2 extra trailing
+# digits read as the part number. Anything else is treated as a fresh,
+# unrelated chapter number (numbering jump, or the first chapter of a
+# session, where there's no prior base to compare against).
 
 CHAPTER_SLUG_PATTERN = re.compile(r"^[A-Za-z]+-(\d+)(?:-(.*))?$")
 
@@ -193,18 +202,46 @@ def parse_chapter_slug(chapter_name):
     return match.group(1), match.group(2)
 
 
+def _match_part_suffix(raw_number_str, base):
+    """
+    If raw_number_str is `base` with 1-2 extra trailing digits, return
+    that suffix as an int (the part number). Otherwise return None.
+    """
+    base_str = str(base)
+    if not raw_number_str.startswith(base_str):
+        return None
+    suffix = raw_number_str[len(base_str):]
+    if suffix.isdigit() and 1 <= len(suffix) <= 2:
+        return int(suffix)
+    return None
+
+
 def resolve_base_and_part(raw_number_str, current_base):
     """
-    Decide whether raw_number_str is a new base chapter number or a part
-    of current_base. Returns (base, part) where part is 0 for a normal,
-    non-part chapter.
+    Decide (base, part) for a freshly-fetched chapter's raw number,
+    given the session's last known base chapter number. part is 0 for a
+    normal, non-part chapter; part is omitted from filenames when it's
+    0 or 1 (only part >= 2 gets a '.N' suffix — see chapter_save_label).
     """
     if current_base is not None:
-        base_str = str(current_base)
-        if raw_number_str.startswith(base_str) and len(raw_number_str) > len(base_str):
-            suffix = raw_number_str[len(base_str):]
-            if suffix.isdigit() and int(suffix) >= 2:
-                return current_base, int(suffix)
+        # Still inside the same multi-part chapter?
+        part = _match_part_suffix(raw_number_str, current_base)
+        if part is not None:
+            return current_base, part
+
+        # Starting the next chapter, possibly with parts of its own?
+        next_base = current_base + 1
+        part = _match_part_suffix(raw_number_str, next_base)
+        if part is not None:
+            return next_base, part
+
+        # Plain, non-part next chapter.
+        if raw_number_str == str(next_base):
+            return next_base, 0
+
+    # No usable prior reference (first chapter of the session) or the
+    # number doesn't relate to current_base at all — treat it as its
+    # own fresh chapter number.
     return int(raw_number_str), 0
 
 
@@ -214,8 +251,8 @@ def chapter_save_label(chapter_name, current_base):
     session's last known base chapter number, return (save_label, new_base).
 
     save_label is what gets used for the saved .txt/.epub filenames:
-        base chapter  -> 'chapter-143-<name>'
-        part 2 of 143 -> 'chapter-143.2-<name>'
+        base chapter (part 0 or 1) -> 'chapter-143-<name>'
+        part 2+ of 143             -> 'chapter-143.2-<name>'
     so build_epub.py can order and label them correctly.
 
     Falls back to returning chapter_name unchanged (and current_base
@@ -227,7 +264,7 @@ def chapter_save_label(chapter_name, current_base):
 
     base, part = resolve_base_and_part(number_str, current_base)
     name_suffix = f"-{name_part}" if name_part else ""
-    if part:
+    if part >= 2:
         label = f"chapter-{base}.{part}{name_suffix}"
     else:
         label = f"chapter-{base}{name_suffix}"
